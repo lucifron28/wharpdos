@@ -1,4 +1,4 @@
-#!usr/bin/bash
+#!/usr/bin/bash
 
 # This script sets up the environment for the project
 echo "Setting up the environment..."
