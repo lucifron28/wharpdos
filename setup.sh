@@ -11,3 +11,8 @@ echo "Virtual environment activated."
 pip install --upgrade pip
 pip install -r requirements.txt
 echo "Requirements installed."
+
+chmod +x wharpdos.py
+
+echo "Setup complete. You can now run the project using 'sudo ./wharpdos.py <interface>'."
+# Note: Make sure to run this script from the root directory of the project.
