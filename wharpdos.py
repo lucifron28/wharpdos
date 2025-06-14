@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/ron/spoof/venv/bin/python
 from scapy.all import *
 import time
 import sys
