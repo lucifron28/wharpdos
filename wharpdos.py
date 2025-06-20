@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/ron/spoof/venv/bin/python3
 from scapy.all import *
 from rich.console import Console
 from rich.table import Table
